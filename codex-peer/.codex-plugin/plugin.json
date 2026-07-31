@@ -1,0 +1,19 @@
+{
+  "name": "codex-peer",
+  "version": "0.1.0+codex.20260730090711",
+  "description": "Use a second local Codex session from inside Codex through the Codex app server.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Peer",
+    "shortDescription": "Delegate review and coding tasks to another Codex session.",
+    "longDescription": "Codex Peer exposes a read-only reviewer and an opt-in writable delegate backed by the local Codex app server.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Ask a second Codex session to review the current changes."
+  },
+  "mcpServers": "./.mcp.json"
+}
