@@ -1,16 +1,16 @@
 {
   "name": "claude-peer",
-  "version": "0.1.0+codex.20260730090713",
+  "version": "0.1.0+codex.20260731005551",
   "description": "Use a local Claude Code session from Codex through the Claude CLI.",
   "author": {
-    "name": "Local developer"
+    "name": "ItsukiYoshida"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Claude Peer",
     "shortDescription": "Delegate reviews and coding tasks to Claude Code.",
     "longDescription": "Claude Peer exposes read-only reviews and opt-in writable delegation backed by the locally authenticated Claude Code CLI.",
-    "developerName": "Local developer",
+    "developerName": "ItsukiYoshida",
     "category": "Productivity",
     "capabilities": [],
     "defaultPrompt": "Ask Claude Code to review the current changes."

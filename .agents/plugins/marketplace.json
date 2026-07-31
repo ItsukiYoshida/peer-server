@@ -1,0 +1,32 @@
+{
+  "name": "peer-server",
+  "interface": {
+    "displayName": "Peer Server"
+  },
+  "plugins": [
+    {
+      "name": "codex-peer",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-peer"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "claude-peer",
+      "source": {
+        "source": "local",
+        "path": "./plugins/claude-peer"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
