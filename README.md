@@ -39,9 +39,7 @@ Use a local marketplace while developing or testing repository changes:
 ```bash
 git clone https://github.com/ItsukiYoshida/peer-server.git
 cd peer-server
-codex plugin marketplace add "$PWD"
-codex plugin add codex-peer@peer-server
-codex plugin add claude-peer@peer-server
+just install
 ```
 
 The `@peer-server` suffix comes from the marketplace name in

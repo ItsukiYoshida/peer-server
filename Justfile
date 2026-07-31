@@ -4,6 +4,11 @@ codex_home := env_var_or_default("CODEX_HOME", home_directory() + "/.codex")
 plugin_validator := env_var_or_default("CODEX_PLUGIN_VALIDATOR", codex_home + "/skills/.system/plugin-creator/scripts/validate_plugin.py")
 skill_validator := env_var_or_default("CODEX_SKILL_VALIDATOR", codex_home + "/skills/.system/skill-creator/scripts/quick_validate.py")
 
+install:
+    codex plugin marketplace add "$PWD"
+    codex plugin add codex-peer@peer-server
+    codex plugin add claude-peer@peer-server
+
 fix:
     just --fmt
 
