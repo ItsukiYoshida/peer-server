@@ -1,0 +1,205 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_LINUX_AMD64_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+  CODEX_VALIDATOR_COMMIT: "4642370542739d5dd080b0c87a9de06a6435d3db"
+  PLUGIN_VALIDATOR_SHA256: "ebda00d55d7518b127f675f062fb5c6e7a1ffdc0a99df1a55ac594400d7d3228"
+  SKILL_VALIDATOR_SHA256: "6cc9dc3199c935916cf6f73fcbbbb0e3bb1b58c8f5109fefa499978908164f51"
+  PYYAML_VERSION: "6.0.3"
+  PYYAML_LINUX_X86_64_SHA256: "0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6"
+
+jobs:
+  changes:
+    name: Detect Change
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect affected components
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          code=false
+          infra=false
+          changed_paths="$RUNNER_TEMP/changed-paths"
+          : > "$changed_paths"
+
+          if [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            git ls-tree --name-only -r "$HEAD_SHA" > "$changed_paths"
+          elif git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
+          else
+            code=true
+            infra=true
+          fi
+
+          while IFS= read -r path; do
+            case "$path" in
+              plugins/*)
+                code=true
+                infra=true
+                ;;
+              Justfile)
+                code=true
+                infra=true
+                ;;
+              .agents/*|.github/*|tests/*|codex-peer|claude-peer)
+                infra=true
+                ;;
+            esac
+          done < "$changed_paths"
+
+          {
+            echo "code=$code"
+            echo "infra=$infra"
+          } >> "$GITHUB_OUTPUT"
+
+  code:
+    name: Code CI
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Set up just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Run code checks
+        run: just check code
+
+  infra:
+    name: Infra CI
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install validator dependency
+        shell: bash
+        run: |
+          requirements_file="$RUNNER_TEMP/validator-requirements.txt"
+          echo "PyYAML==$PYYAML_VERSION --hash=sha256:$PYYAML_LINUX_X86_64_SHA256" > "$requirements_file"
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement "$requirements_file"
+
+      - name: Install Codex validators
+        shell: bash
+        run: |
+          validator_root="$RUNNER_TEMP/codex-validators"
+          plugin_validator="$validator_root/validate_plugin.py"
+          skill_validator="$validator_root/quick_validate.py"
+          mkdir -p "$validator_root"
+
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/openai/codex/$CODEX_VALIDATOR_COMMIT/codex-rs/skills/src/assets/samples/plugin-creator/scripts/validate_plugin.py" \
+            --output "$plugin_validator"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/openai/codex/$CODEX_VALIDATOR_COMMIT/codex-rs/skills/src/assets/samples/skill-creator/scripts/quick_validate.py" \
+            --output "$skill_validator"
+
+          echo "$PLUGIN_VALIDATOR_SHA256  $plugin_validator" | sha256sum --check
+          echo "$SKILL_VALIDATOR_SHA256  $skill_validator" | sha256sum --check
+          {
+            echo "CODEX_PLUGIN_VALIDATOR=$plugin_validator"
+            echo "CODEX_SKILL_VALIDATOR=$skill_validator"
+          } >> "$GITHUB_ENV"
+
+      - name: Install actionlint
+        env:
+          GH_REPO: rhysd/actionlint
+        shell: bash
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          archive_path="$RUNNER_TEMP/$archive"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/$GH_REPO/releases/download/v$ACTIONLINT_VERSION/$archive" \
+            --output "$archive_path"
+          echo "$ACTIONLINT_LINUX_AMD64_SHA256  $archive_path" | sha256sum --check
+          tar --extract --gzip --file "$archive_path" --directory "$RUNNER_TEMP" actionlint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Run infrastructure checks
+        run: just check infra
+
+  complete:
+    name: Complete CI
+    if: always()
+    needs:
+      - changes
+      - code
+      - infra
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify required jobs
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CODE_RESULT: ${{ needs.code.result }}
+          INFRA_RESULT: ${{ needs.infra.result }}
+        shell: bash
+        run: |
+          test "$CHANGES_RESULT" = success
+
+          for result in "$CODE_RESULT" "$INFRA_RESULT"; do
+            case "$result" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

@@ -13,6 +13,7 @@ Install the following tools before working on the repository:
 - Git
 - Node.js with the built-in `node:test` runner
 - [just](https://github.com/casey/just)
+- [actionlint](https://github.com/rhysd/actionlint) 1.7.12
 - Python 3
 
 The full validation command also uses the plugin and skill validators from a
@@ -75,10 +76,21 @@ just check
 ```
 
 `just fix` formats the `Justfile`. `just check` verifies the `Justfile` and
-marketplace JSON, checks JavaScript syntax, runs both test suites, and validates
-both plugin packages and their skills. If a required validator is unavailable,
-run every remaining check and clearly describe the validation limitation in the
-pull request.
+GitHub Actions workflows, checks plugin packaging and JavaScript syntax, runs
+both bridge test suites, and validates both plugin packages and their skills. If
+a required validator is unavailable, run every remaining check and clearly
+describe the validation limitation in the pull request.
+
+The CI workflow runs the repository checks as separate components:
+
+```bash
+just check code
+just check infra
+```
+
+Infra CI downloads checksum-pinned copies of the official plugin and skill
+validators from a pinned OpenAI Codex revision. Local checks use the equivalent
+validators supplied by the local Codex installation.
 
 ## Implementation guidelines
 

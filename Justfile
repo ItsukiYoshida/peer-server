@@ -12,9 +12,27 @@ install:
 fix:
     just --fmt
 
-check:
-    just --fmt --check
-    node -e 'JSON.parse(require("node:fs").readFileSync(".agents/plugins/marketplace.json", "utf8"))'
+check component="all":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ component }}" in
+      all)
+        just _check-code
+        just _check-infra
+        ;;
+      code)
+        just _check-code
+        ;;
+      infra)
+        just _check-infra
+        ;;
+      *)
+        echo "unknown check component: {{ component }}" >&2
+        exit 2
+        ;;
+    esac
+
+_check-code:
     node --check plugins/codex-peer/scripts/codex-peer-mcp.mjs
     node --check plugins/codex-peer/tests/fake-codex.mjs
     node --check plugins/codex-peer/tests/codex-peer-mcp.test.mjs
@@ -23,6 +41,13 @@ check:
     node --check plugins/claude-peer/tests/claude-peer-mcp.test.mjs
     node --test plugins/codex-peer/tests/codex-peer-mcp.test.mjs
     node --test plugins/claude-peer/tests/claude-peer-mcp.test.mjs
+
+_check-infra:
+    just --fmt --check
+    actionlint -color
+    node --test tests/plugin-packaging.test.mjs
+    test "$(readlink codex-peer)" = plugins/codex-peer
+    test "$(readlink claude-peer)" = plugins/claude-peer
     python3 "{{ plugin_validator }}" plugins/codex-peer
     python3 "{{ plugin_validator }}" plugins/claude-peer
     python3 "{{ skill_validator }}" plugins/codex-peer/skills/codex-peer
