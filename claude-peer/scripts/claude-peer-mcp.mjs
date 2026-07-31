@@ -1,0 +1,762 @@
+#!/usr/bin/env node
+
+import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { createInterface } from "node:readline";
+import process from "node:process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const SERVER_VERSION = "0.1.0";
+const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+const MAX_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const HARD_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+const parsedMaxOutputBytes = Number.parseInt(
+  process.env.CLAUDE_PEER_MAX_OUTPUT_BYTES || String(HARD_MAX_OUTPUT_BYTES),
+  10,
+);
+const MAX_OUTPUT_BYTES =
+  Number.isInteger(parsedMaxOutputBytes) && parsedMaxOutputBytes >= 1024
+    ? Math.min(parsedMaxOutputBytes, HARD_MAX_OUTPUT_BYTES)
+    : HARD_MAX_OUTPUT_BYTES;
+const MAX_TASK_BYTES = 256 * 1024;
+const MAX_RUNNING_JOBS = 4;
+const MAX_RETAINED_TERMINAL_JOBS = 50;
+const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const PEER_DEPTH_ENV = "CLAUDE_PEER_DEPTH";
+const CLAUDE_CLI = process.env.CLAUDE_PEER_CLI || "claude";
+const parsedKillGraceMs = Number.parseInt(process.env.CLAUDE_PEER_KILL_GRACE_MS || "2000", 10);
+const KILL_GRACE_MS =
+  Number.isInteger(parsedKillGraceMs) && parsedKillGraceMs >= 10
+    ? Math.min(parsedKillGraceMs, 10000)
+    : 2000;
+const parsedPeerDepth = Number.parseInt(process.env[PEER_DEPTH_ENV] || "0", 10);
+const peerDepth = Number.isInteger(parsedPeerDepth) && parsedPeerDepth >= 0 ? parsedPeerDepth : 0;
+const isNestedPeer = peerDepth > 0;
+const RECURSION_GUARD_MESSAGE = `claude-peer is disabled inside nested peer sessions (depth ${peerDepth})`;
+const jobs = new Map();
+let nextCompletionSequence = 1;
+
+const BASE_SANDBOX_SETTINGS = {
+  sandbox: {
+    enabled: true,
+    autoAllowBashIfSandboxed: true,
+    allowUnsandboxedCommands: false,
+    failIfUnavailable: true,
+  },
+};
+
+const READ_ONLY_SANDBOX_SETTINGS = JSON.stringify({
+  sandbox: {
+    ...BASE_SANDBOX_SETTINGS.sandbox,
+    filesystem: {
+      denyWrite: ["/"],
+    },
+  },
+});
+
+const WRITE_SANDBOX_SETTINGS = JSON.stringify(BASE_SANDBOX_SETTINGS);
+
+const EMPTY_MCP_CONFIG = JSON.stringify({ mcpServers: {} });
+
+const tools = [
+  {
+    name: "claude_peer_auth_status",
+    description:
+      "Return a sanitized Claude Code authentication status without account identifiers or credentials.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_review",
+    description:
+      "Start a read-only Claude Code review and immediately return a job ID. Poll with claude_peer_status, then collect the result with claude_peer_result.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        request: { type: "string", description: "Optional review focus or question." },
+        base: { type: "string", description: "Optional branch or ref to compare against." },
+        cwd: { type: "string", description: "Workspace path. Defaults to the current workspace." },
+        model: { type: "string", description: "Optional Claude model override." },
+        effort: { type: "string", description: "Optional Claude effort override." },
+        timeout_seconds: { type: "integer", minimum: 30, maximum: 7200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_delegate",
+    description:
+      "Start a Claude Code task and immediately return a job ID. Poll with claude_peer_status, then collect the result with claude_peer_result. Defaults to read-only; set allow_writes=true only when the user explicitly authorizes edits.",
+    inputSchema: {
+      type: "object",
+      required: ["task"],
+      properties: {
+        task: { type: "string", description: "Task for the Claude Code session." },
+        allow_writes: { type: "boolean", description: "Allow edits in the workspace; default false." },
+        cwd: { type: "string", description: "Workspace path. Defaults to the current workspace." },
+        model: { type: "string", description: "Optional Claude model override." },
+        effort: { type: "string", description: "Optional Claude effort override." },
+        timeout_seconds: { type: "integer", minimum: 30, maximum: 7200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_follow_up",
+    description:
+      "Continue an existing Claude Code session in the background and immediately return a job ID. Poll with claude_peer_status, then collect the result with claude_peer_result.",
+    inputSchema: {
+      type: "object",
+      required: ["thread_id", "task"],
+      properties: {
+        thread_id: { type: "string" },
+        task: { type: "string" },
+        allow_writes: { type: "boolean", description: "Allow edits in the workspace; default false." },
+        cwd: { type: "string", description: "Workspace path. Defaults to the current workspace." },
+        model: { type: "string", description: "Optional Claude model override." },
+        effort: { type: "string", description: "Optional Claude effort override." },
+        timeout_seconds: { type: "integer", minimum: 30, maximum: 7200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_start",
+    description:
+      "Start an explicitly constructed Claude Code background task and return a job ID.",
+    inputSchema: {
+      type: "object",
+      required: ["task"],
+      properties: {
+        task: { type: "string" },
+        allow_writes: { type: "boolean", description: "Allow edits in the workspace; default false." },
+        cwd: { type: "string", description: "Workspace path. Defaults to the current workspace." },
+        model: { type: "string" },
+        effort: { type: "string" },
+        timeout_seconds: { type: "integer", minimum: 30, maximum: 7200 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_status",
+    description:
+      "Show the state of a Claude Peer background job, or the latest few jobs when no job ID is supplied.",
+    inputSchema: {
+      type: "object",
+      properties: { job_id: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_result",
+    description: "Return the stored final result of a completed Claude Peer background job.",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "claude_peer_cancel",
+    description: "Cancel a running Claude Peer background job.",
+    inputSchema: {
+      type: "object",
+      required: ["job_id"],
+      properties: { job_id: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+];
+const toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
+
+function writeMessage(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function textResult(text, isError = false) {
+  return {
+    content: [{ type: "text", text }],
+    isError,
+  };
+}
+
+function jsonRpcError(id, code, message, data) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code,
+      message,
+      ...(data === undefined ? {} : { data }),
+    },
+  };
+}
+
+function validateToolInvocation(params) {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    throw new Error("tools/call params must be an object");
+  }
+  if (typeof params.name !== "string" || !toolsByName.has(params.name)) {
+    throw new Error(`Unknown tool: ${String(params.name)}`);
+  }
+  const args = params.arguments ?? {};
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("Tool arguments must be an object");
+  }
+  const schema = toolsByName.get(params.name).inputSchema;
+  const properties = schema.properties || {};
+  for (const key of Object.keys(args)) {
+    if (!(key in properties)) throw new Error(`Unknown argument for ${params.name}: ${key}`);
+  }
+  for (const key of schema.required || []) {
+    if (!(key in args)) throw new Error(`Missing required argument for ${params.name}: ${key}`);
+  }
+  for (const [key, value] of Object.entries(args)) {
+    const property = properties[key];
+    if (property.type === "string" && typeof value !== "string") {
+      throw new Error(`${key} must be a string`);
+    }
+    if (property.type === "boolean" && typeof value !== "boolean") {
+      throw new Error(`${key} must be a boolean`);
+    }
+    if (property.type === "integer" && !Number.isInteger(value)) {
+      throw new Error(`${key} must be an integer`);
+    }
+    if (property.minimum !== undefined && value < property.minimum) {
+      throw new Error(`${key} must be at least ${property.minimum}`);
+    }
+    if (property.maximum !== undefined && value > property.maximum) {
+      throw new Error(`${key} must be at most ${property.maximum}`);
+    }
+  }
+  return { name: params.name, args };
+}
+
+function normalizeArgs(args) {
+  const value = args && typeof args === "object" ? args : {};
+  const cwd = typeof value.cwd === "string" && value.cwd.length > 0 ? value.cwd : process.cwd();
+  const timeoutSeconds = Number.isFinite(value.timeout_seconds)
+    ? Math.min(Math.max(Number(value.timeout_seconds), 30), 7200)
+    : DEFAULT_TIMEOUT_MS / 1000;
+  return {
+    ...value,
+    cwd,
+    timeoutMs: timeoutSeconds * 1000,
+    allowWrites: value.allow_writes === true,
+  };
+}
+
+function formatPeerResult(result) {
+  const parts = [];
+  const threadId = result.threadId || result.thread_id;
+  const jobId = result.jobId || result.job_id;
+  if (result.status) parts.push(`status: ${result.status}`);
+  if (threadId) parts.push(`thread_id: ${threadId}`);
+  if (jobId) parts.push(`job_id: ${jobId}`);
+  if (result.text) parts.push(result.text);
+  if (result.error) parts.push(`error: ${result.error}`);
+  if (Array.isArray(result.permissionDenials) && result.permissionDenials.length > 0) {
+    parts.push(`permission_denials: ${JSON.stringify(result.permissionDenials)}`);
+  }
+  return parts.join("\n\n") || "Claude peer returned no output.";
+}
+
+function validateCwd(cwd) {
+  let stat;
+  try {
+    stat = statSync(cwd);
+  } catch (error) {
+    throw new Error(`Workspace is not accessible: ${cwd} (${error.message})`);
+  }
+  if (!stat.isDirectory()) throw new Error(`Workspace is not a directory: ${cwd}`);
+}
+
+function parseClaudeJson(stdout) {
+  const value = stdout.trim();
+  if (!value) throw new Error("Claude Code returned no JSON output");
+  try {
+    return JSON.parse(value);
+  } catch {
+    const lines = value.split(/\r?\n/).filter(Boolean);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      try {
+        return JSON.parse(lines[index]);
+      } catch {
+        // Keep looking for the final JSON result line.
+      }
+    }
+  }
+  throw new Error("Claude Code returned invalid JSON output");
+}
+
+class ClaudeProcessClient {
+  constructor({ cwd, allowWrites, model, effort }) {
+    this.cwd = cwd;
+    this.allowWrites = allowWrites;
+    this.model = model;
+    this.effort = effort;
+    this.child = null;
+    this.processGroupId = null;
+    this.stopReason = null;
+    this.terminationPromise = null;
+  }
+
+  buildArgs(sessionId) {
+    const args = [
+      "-p",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      this.allowWrites ? "acceptEdits" : "plan",
+      "--safe-mode",
+      "--mcp-config",
+      EMPTY_MCP_CONFIG,
+      "--strict-mcp-config",
+      "--no-chrome",
+      "--prompt-suggestions",
+      "false",
+    ];
+    args.push(
+      "--settings",
+      this.allowWrites ? WRITE_SANDBOX_SETTINGS : READ_ONLY_SANDBOX_SETTINGS,
+    );
+    if (this.allowWrites) {
+      args.push("--tools", "Read,Glob,Grep,Bash,Edit,Write,NotebookEdit");
+      args.push(
+        "--allowedTools",
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+      );
+    } else {
+      args.push("--tools", "Read,Glob,Grep,Bash");
+      args.push("--allowedTools", "Read", "Glob", "Grep", "Bash");
+      args.push("--disallowedTools", "Edit,Write,NotebookEdit");
+    }
+    if (this.model) args.push("--model", String(this.model));
+    if (this.effort) args.push("--effort", String(this.effort));
+    if (sessionId) args.push("--resume", sessionId);
+    return args;
+  }
+
+  run({ task, threadId }) {
+    return new Promise((resolve, reject) => {
+      const args = this.buildArgs(threadId);
+      const child = spawn(CLAUDE_CLI, args, {
+        cwd: this.cwd,
+        env: {
+          ...process.env,
+          [PEER_DEPTH_ENV]: String(peerDepth + 1),
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
+        },
+        detached: process.platform !== "win32",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      this.child = child;
+      this.processGroupId = process.platform === "win32" ? null : child.pid;
+      const stdoutChunks = [];
+      let stdoutBytes = 0;
+      let stderrText = "";
+      let settled = false;
+      const resolveOnce = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const rejectOnce = (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      child.stdout.on("data", (chunk) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > MAX_OUTPUT_BYTES) {
+          child.stdout.pause();
+          void this.terminate(`Claude peer output exceeded ${MAX_OUTPUT_BYTES} bytes`).catch(() => {});
+          return;
+        }
+        stdoutChunks.push(chunk);
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderrText = `${stderrText}${chunk}`.slice(-8000);
+      });
+      child.stdin.on("error", () => {});
+      child.stdin.end(task);
+      child.once("error", (error) => rejectOnce(error));
+      child.once("close", (code, signal) => {
+        if (this.stopReason) {
+          rejectOnce(new Error(this.stopReason));
+          return;
+        }
+        if (code !== 0) {
+          rejectOnce(
+            new Error(
+              stderrText.trim() ||
+                `Claude Code exited (${code ?? "unknown"}${signal ? `, ${signal}` : ""})`,
+            ),
+          );
+          return;
+        }
+        try {
+          const payload = parseClaudeJson(Buffer.concat(stdoutChunks).toString("utf8"));
+          if (payload.is_error === true || payload.subtype === "error") {
+            throw new Error(
+              payload.result || payload.api_error_status || "Claude Code task failed",
+            );
+          }
+          if (typeof payload.session_id !== "string" || payload.session_id.length === 0) {
+            throw new Error("Claude Code result did not include a session ID");
+          }
+          resolveOnce({
+            status: "completed",
+            text: typeof payload.result === "string" ? payload.result : "",
+            threadId: payload.session_id,
+            permissionDenials: payload.permission_denials,
+            durationMs: payload.duration_ms,
+            numTurns: payload.num_turns,
+          });
+        } catch (error) {
+          rejectOnce(error);
+        }
+      });
+    });
+  }
+
+  signalTree(signal) {
+    if (process.platform !== "win32" && this.processGroupId) {
+      try {
+        process.kill(-this.processGroupId, signal);
+        return;
+      } catch {
+        // Fall back to signaling only the direct child.
+      }
+    }
+    if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) return;
+    try {
+      this.child.kill(signal);
+    } catch {
+      // The process may have exited between the state check and the signal.
+    }
+  }
+
+  isProcessTreeAlive() {
+    if (process.platform !== "win32" && this.processGroupId) {
+      try {
+        process.kill(-this.processGroupId, 0);
+        return true;
+      } catch (error) {
+        return error.code !== "ESRCH";
+      }
+    }
+    return Boolean(
+      this.child && this.child.exitCode === null && this.child.signalCode === null,
+    );
+  }
+
+  terminate(reason = "Claude peer stopped") {
+    this.stopReason = this.stopReason || reason;
+    if (!this.isProcessTreeAlive()) return Promise.resolve();
+    if (this.terminationPromise) return this.terminationPromise;
+    this.terminationPromise = new Promise((resolve, reject) => {
+      let finished = false;
+      let pollTimer;
+      let killTimer;
+      let confirmationTimer;
+      const finish = (error) => {
+        if (finished) return;
+        finished = true;
+        clearInterval(pollTimer);
+        clearTimeout(killTimer);
+        clearTimeout(confirmationTimer);
+        if (error) reject(error);
+        else resolve();
+      };
+      this.signalTree("SIGTERM");
+      pollTimer = setInterval(() => {
+        if (!this.isProcessTreeAlive()) finish();
+      }, 10);
+      killTimer = setTimeout(() => {
+        this.signalTree("SIGKILL");
+        confirmationTimer = setTimeout(() => {
+          if (this.isProcessTreeAlive()) {
+            finish(new Error("Claude peer process group survived SIGKILL"));
+          } else {
+            finish();
+          }
+        }, 1000);
+      }, KILL_GRACE_MS);
+    });
+    return this.terminationPromise;
+  }
+}
+
+function runWithTimeout(promise, timeoutMs) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Claude peer timed out after ${Math.round(timeoutMs / 1000)} seconds`)),
+      Math.min(timeoutMs, MAX_TIMEOUT_MS),
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function pruneTerminalJobs() {
+  const terminalJobs = [...jobs.values()]
+    .filter((job) => job.status !== "running" && job.status !== "cancelling")
+    .sort((left, right) => left.completionSequence - right.completionSequence);
+  const excess = terminalJobs.length - MAX_RETAINED_TERMINAL_JOBS;
+  for (let index = 0; index < excess; index += 1) jobs.delete(terminalJobs[index].jobId);
+}
+
+function transitionJobToTerminal(job, status, result) {
+  if (job.status !== "running" && job.status !== "cancelling") return false;
+  job.status = status;
+  job.result = result;
+  job.finishedAt = new Date().toISOString();
+  job.completionSequence = nextCompletionSequence++;
+  return true;
+}
+
+function startJob(args, threadId = null) {
+  const value = normalizeArgs(args);
+  if (typeof value.task !== "string" || value.task.trim() === "") throw new Error("task is required");
+  if (Buffer.byteLength(value.task, "utf8") > MAX_TASK_BYTES) {
+    throw new Error(`task exceeds ${MAX_TASK_BYTES} bytes`);
+  }
+  if (threadId !== null && (typeof threadId !== "string" || threadId.trim() === "")) {
+    throw new Error("thread_id is required");
+  }
+  const runningJobs = [...jobs.values()].filter(
+    (job) => job.status === "running" || job.status === "cancelling",
+  ).length;
+  if (runningJobs >= MAX_RUNNING_JOBS) {
+    throw new Error(`Claude peer already has ${MAX_RUNNING_JOBS} active jobs`);
+  }
+  validateCwd(value.cwd);
+  const jobId = `claude-peer-${randomUUID().slice(0, 8)}`;
+  const job = {
+    jobId,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    result: null,
+    client: null,
+    cancelRequested: false,
+    completionPromise: null,
+  };
+  jobs.set(jobId, job);
+  const client = new ClaudeProcessClient(value);
+  job.client = client;
+  job.completionPromise = runWithTimeout(
+    client.run({ task: value.task, threadId }),
+    value.timeoutMs,
+  )
+    .then((result) => {
+      transitionJobToTerminal(job, "completed", { ...result, jobId });
+      job.client = null;
+      pruneTerminalJobs();
+    })
+    .catch(async (error) => {
+      let terminationError = null;
+      try {
+        await client.terminate(
+          job.cancelRequested ? "Claude peer cancelled" : "Claude peer stopped",
+        );
+      } catch (caught) {
+        terminationError = caught;
+      }
+      const status = job.cancelRequested && !terminationError ? "cancelled" : "failed";
+      const message = terminationError
+        ? `${error.message}; ${terminationError.message}`
+        : error.message;
+      transitionJobToTerminal(job, status, { jobId, error: message });
+      job.client = null;
+      pruneTerminalJobs();
+    });
+  return job;
+}
+
+function publicJob(job) {
+  return {
+    job_id: job.jobId,
+    status: job.status,
+    started_at: job.startedAt,
+    finished_at: job.finishedAt || null,
+    thread_id: job.result?.threadId || null,
+    error: job.result?.error || null,
+  };
+}
+
+async function sanitizedAuthStatus() {
+  const { stdout } = await execFileAsync(CLAUDE_CLI, ["auth", "status", "--json"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      [PEER_DEPTH_ENV]: String(peerDepth + 1),
+    },
+    timeout: 30000,
+    maxBuffer: 1024 * 1024,
+  });
+  const payload = parseClaudeJson(stdout);
+  return JSON.stringify({
+    logged_in: payload.loggedIn === true,
+    auth_method: typeof payload.authMethod === "string" ? payload.authMethod : null,
+    api_provider: typeof payload.apiProvider === "string" ? payload.apiProvider : null,
+    subscription_type:
+      typeof payload.subscriptionType === "string" ? payload.subscriptionType : null,
+  });
+}
+
+async function callTool(name, args) {
+  if (isNestedPeer) throw new Error(RECURSION_GUARD_MESSAGE);
+  if (name === "claude_peer_auth_status") return await sanitizedAuthStatus();
+  if (name === "claude_peer_review") {
+    const value = normalizeArgs(args);
+    const scope = value.base
+      ? `Review the changes compared with ${value.base}.`
+      : "Review the current uncommitted changes.";
+    const focus = value.request ? `\nFocus especially on: ${value.request}` : "";
+    const job = startJob({
+      ...value,
+      allow_writes: false,
+      task: `${scope}${focus}\nBe read-only. Report only reproducible P0-P2 findings with severity, exact file/line evidence, the triggering scenario, impact, and a concrete fix. If there are no findings, say No findings. State validation ceilings separately.`,
+    });
+    return formatPeerResult({ ...publicJob(job), status: "started" });
+  }
+  if (name === "claude_peer_delegate") {
+    const job = startJob(args);
+    return formatPeerResult({ ...publicJob(job), status: "started" });
+  }
+  if (name === "claude_peer_follow_up") {
+    const job = startJob(args, args?.thread_id);
+    return formatPeerResult({ ...publicJob(job), status: "started" });
+  }
+  if (name === "claude_peer_start") {
+    const job = startJob(args);
+    return formatPeerResult({ ...publicJob(job), status: "started" });
+  }
+  if (name === "claude_peer_status") {
+    const selected = args?.job_id ? [jobs.get(args.job_id)] : [...jobs.values()].slice(-10).reverse();
+    if (selected.some((job) => !job)) throw new Error(`Unknown job: ${args.job_id}`);
+    return selected.map(publicJob).map((job) => JSON.stringify(job)).join("\n");
+  }
+  if (name === "claude_peer_result") {
+    const job = jobs.get(args?.job_id);
+    if (!job) throw new Error(`Unknown job: ${args?.job_id}`);
+    if (job.status === "running" || job.status === "cancelling") {
+      return JSON.stringify(publicJob(job));
+    }
+    return formatPeerResult(job.result || publicJob(job));
+  }
+  if (name === "claude_peer_cancel") {
+    const job = jobs.get(args?.job_id);
+    if (!job) throw new Error(`Unknown job: ${args?.job_id}`);
+    if (job.status === "running") {
+      job.status = "cancelling";
+      job.cancelRequested = true;
+      try {
+        await job.client?.terminate("Claude peer cancelled");
+      } catch {
+        // The job completion path records termination failures.
+      }
+      await job.completionPromise;
+    } else if (job.status === "cancelling") {
+      await job.completionPromise;
+    }
+    return JSON.stringify(publicJob(job));
+  }
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+async function handleMessage(message) {
+  if (message.method === "initialize") {
+    const requestedVersion = message.params?.protocolVersion;
+    if (typeof requestedVersion !== "string") {
+      return jsonRpcError(message.id, -32602, "protocolVersion must be a string");
+    }
+    const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion)
+      ? requestedVersion
+      : SUPPORTED_PROTOCOL_VERSIONS[0];
+    return {
+      jsonrpc: "2.0",
+      id: message.id,
+      result: {
+        protocolVersion,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "claude-peer", version: SERVER_VERSION },
+      },
+    };
+  }
+  if (message.method === "notifications/initialized") return null;
+  if (message.method === "ping") return { jsonrpc: "2.0", id: message.id, result: {} };
+  if (message.method === "tools/list") {
+    return { jsonrpc: "2.0", id: message.id, result: { tools: isNestedPeer ? [] : tools } };
+  }
+  if (message.method === "tools/call") {
+    let invocation;
+    try {
+      invocation = validateToolInvocation(message.params);
+    } catch (error) {
+      return jsonRpcError(message.id, -32602, error.message);
+    }
+    try {
+      const text = await callTool(invocation.name, invocation.args);
+      return { jsonrpc: "2.0", id: message.id, result: textResult(text) };
+    } catch (error) {
+      return { jsonrpc: "2.0", id: message.id, result: textResult(error.message, true) };
+    }
+  }
+  if (message.id === undefined) return null;
+  return {
+    jsonrpc: "2.0",
+    id: message.id,
+    error: { code: -32601, message: `Method not found: ${message.method}` },
+  };
+}
+
+const input = createInterface({ input: process.stdin });
+input.on("line", async (line) => {
+  if (!line.trim()) return;
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const response = await handleMessage(message);
+  if (response) writeMessage(response);
+});
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const activeJobs = [...jobs.values()].filter(
+    (job) => job.status === "running" || job.status === "cancelling",
+  );
+  for (const job of activeJobs) {
+    job.status = "cancelling";
+    job.cancelRequested = true;
+  }
+  await Promise.allSettled(
+    activeJobs.map((job) => job.client?.terminate("Claude peer server stopped")),
+  );
+  await Promise.allSettled(activeJobs.map((job) => job.completionPromise));
+  process.exit(0);
+}
+
+input.on("close", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
+process.on("SIGINT", () => void shutdown());

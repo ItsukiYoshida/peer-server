@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "claude_peer": {
+      "command": "node",
+      "args": [
+        "./scripts/claude-peer-mcp.mjs"
+      ],
+      "cwd": "."
+    }
+  }
+}
