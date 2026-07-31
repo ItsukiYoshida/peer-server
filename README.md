@@ -11,6 +11,10 @@ Both plugins use background jobs. A long-running review or delegated task return
 `job_id` immediately; callers poll the matching status tool and retrieve the result
 after the job reaches a terminal state.
 
+When Claude Code reports a subscription usage limit, failed job status and result
+responses include `error_type: UsageLimit` and the reset time as
+`unavailable_until`, when Claude provides one.
+
 Each bridge accepts at most four concurrent jobs, caps task input at 256 KiB and
 captured output at 8 MiB, and retains the latest 50 terminal jobs. Cancellation
 first enters `cancelling`, terminates the worker process group, escalates from

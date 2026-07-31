@@ -22,6 +22,8 @@ stores an API key or subscription token.
   start background jobs and immediately return a `job_id`. Poll with
   `claude_peer_status`; after the job reaches a terminal state, retrieve the
   response with `claude_peer_result`.
+- If Claude Code reaches its subscription usage limit, status and result responses
+  report `error_type: UsageLimit` and `unavailable_until` with Claude's reset time.
 - Use `claude_peer_start` for an explicitly constructed background task and
   `claude_peer_cancel` to stop one.
 

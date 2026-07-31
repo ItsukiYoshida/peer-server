@@ -261,6 +261,10 @@ function formatPeerResult(result) {
   if (threadId) parts.push(`thread_id: ${threadId}`);
   if (jobId) parts.push(`job_id: ${jobId}`);
   if (result.text) parts.push(result.text);
+  if (result.errorType) parts.push(`error_type: ${result.errorType}`);
+  if (result.unavailableUntil) {
+    parts.push(`unavailable_until: ${result.unavailableUntil}`);
+  }
   if (result.error) parts.push(`error: ${result.error}`);
   if (Array.isArray(result.permissionDenials) && result.permissionDenials.length > 0) {
     parts.push(`permission_denials: ${JSON.stringify(result.permissionDenials)}`);
@@ -294,6 +298,65 @@ function parseClaudeJson(stdout) {
     }
   }
   throw new Error("Claude Code returned invalid JSON output");
+}
+
+class ClaudeUsageLimitError extends Error {
+  constructor(unavailableUntil) {
+    super(
+      unavailableUntil
+        ? `Claude Code usage limit reached; unavailable until ${unavailableUntil}.`
+        : "Claude Code usage limit reached; reset time was not provided.",
+    );
+    this.name = "UsageLimit";
+    this.unavailableUntil = unavailableUntil;
+  }
+}
+
+function errorText(value) {
+  if (typeof value === "string") return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => errorText(item))
+      .filter(Boolean)
+      .join(" ");
+  }
+  if (!value || typeof value !== "object") return "";
+  return [value.message, value.text, value.detail, value.error, value.content]
+    .map((item) => errorText(item))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function claudeFailureFromPayload(payload) {
+  const detailParts = [
+    errorText(payload.result),
+    errorText(payload.errors),
+    errorText(payload.error),
+    errorText(payload.message),
+  ].filter(Boolean);
+  const details = detailParts.join(" ");
+  const status = Number(
+    payload.api_error_status ??
+      payload.status_code ??
+      payload.error?.status ??
+      payload.error?.status_code,
+  );
+  const explicitlyNotUsageLimit = /\bnot (?:your )?usage limit\b/i.test(details);
+  const isUsageLimit =
+    !explicitlyNotUsageLimit &&
+    (/\byou(?:['’]ve| have) (?:hit|reached) your (?:[a-z0-9][a-z0-9 -]{0,63} )?limit\b/i.test(
+      details,
+    ) ||
+      /\b(?:session|usage) limit (?:has been )?(?:reached|exceeded)\b/i.test(details) ||
+      ((status === 429 || payload.error === "rate_limit") &&
+        /\bresets?(?:\s+at)?\s+/i.test(details)));
+  if (isUsageLimit) {
+    const resetText = detailParts.find((part) => /\bresets?(?:\s+at)?\s+/i.test(part)) || "";
+    const resetMatch = resetText.match(/\bresets?(?:\s+at)?\s+([^\r\n]+)/i);
+    const unavailableUntil = resetMatch?.[1]?.trim().replace(/[.!?]+$/, "") || null;
+    throw new ClaudeUsageLimitError(unavailableUntil);
+  }
+  throw new Error(detailParts[0] || String(payload.api_error_status || "Claude Code task failed"));
 }
 
 class ClaudeProcessClient {
@@ -400,7 +463,32 @@ class ClaudeProcessClient {
           rejectOnce(new Error(this.stopReason));
           return;
         }
+        const stdoutText = Buffer.concat(stdoutChunks).toString("utf8");
         if (code !== 0) {
+          let payload = null;
+          try {
+            payload = parseClaudeJson(stdoutText);
+          } catch {
+            // Non-JSON failures fall back to stderr or the process exit status.
+          }
+          if (payload && typeof payload === "object") {
+            try {
+              claudeFailureFromPayload(payload);
+            } catch (error) {
+              if (error instanceof ClaudeUsageLimitError) {
+                rejectOnce(error);
+                return;
+              }
+              rejectOnce(
+                new Error(
+                  error.message ||
+                    stderrText.trim() ||
+                    `Claude Code exited (${code ?? "unknown"}${signal ? `, ${signal}` : ""})`,
+                ),
+              );
+              return;
+            }
+          }
           rejectOnce(
             new Error(
               stderrText.trim() ||
@@ -410,11 +498,9 @@ class ClaudeProcessClient {
           return;
         }
         try {
-          const payload = parseClaudeJson(Buffer.concat(stdoutChunks).toString("utf8"));
+          const payload = parseClaudeJson(stdoutText);
           if (payload.is_error === true || payload.subtype === "error") {
-            throw new Error(
-              payload.result || payload.api_error_status || "Claude Code task failed",
-            );
+            claudeFailureFromPayload(payload);
           }
           if (typeof payload.session_id !== "string" || payload.session_id.length === 0) {
             throw new Error("Claude Code result did not include a session ID");
@@ -581,7 +667,13 @@ function startJob(args, threadId = null) {
       const message = terminationError
         ? `${error.message}; ${terminationError.message}`
         : error.message;
-      transitionJobToTerminal(job, status, { jobId, error: message });
+      transitionJobToTerminal(job, status, {
+        jobId,
+        error: message,
+        errorType: error instanceof ClaudeUsageLimitError ? error.name : null,
+        unavailableUntil:
+          error instanceof ClaudeUsageLimitError ? error.unavailableUntil : null,
+      });
       job.client = null;
       pruneTerminalJobs();
     });
@@ -596,6 +688,8 @@ function publicJob(job) {
     finished_at: job.finishedAt || null,
     thread_id: job.result?.threadId || null,
     error: job.result?.error || null,
+    error_type: job.result?.errorType || null,
+    unavailable_until: job.result?.unavailableUntil || null,
   };
 }
 

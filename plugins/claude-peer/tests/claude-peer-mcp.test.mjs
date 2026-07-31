@@ -169,6 +169,92 @@ test("writable delegation uses accept-edits with a fail-closed sandbox", async (
   await client.close();
 });
 
+test("usage limit failures report their type and reset time", async () => {
+  const client = new McpTestClient();
+  await client.initialize();
+  const started = await client.call("claude_peer_delegate", {
+    task: "USAGE_LIMIT",
+    cwd: testDir,
+  });
+  const id = jobId(started);
+  assert.ok(id);
+  const status = await waitForTerminal(client, id);
+  assert.equal(status.status, "failed");
+  assert.equal(status.error_type, "UsageLimit");
+  assert.equal(status.unavailable_until, "4:10pm (Asia/Tokyo)");
+  assert.equal(
+    status.error,
+    "Claude Code usage limit reached; unavailable until 4:10pm (Asia/Tokyo).",
+  );
+
+  const result = await client.call("claude_peer_result", { job_id: id });
+  assert.match(resultText(result), /error_type: UsageLimit/);
+  assert.match(resultText(result), /unavailable_until: 4:10pm \(Asia\/Tokyo\)/);
+  assert.doesNotMatch(resultText(result), /Permission mode forced/);
+  await client.close();
+});
+
+test("named subscription limits remain UsageLimit without a reset time", async () => {
+  const client = new McpTestClient();
+  try {
+    await client.initialize();
+    for (const task of [
+      "FAST_USAGE_LIMIT",
+      "MONTHLY_USAGE_LIMIT",
+      "MONTHLY_SPEND_USAGE_LIMIT",
+      "FABLE_USAGE_LIMIT",
+      "WEEKLY_USAGE_LIMIT",
+      "OPUS_USAGE_LIMIT",
+      "SONNET_USAGE_LIMIT",
+    ]) {
+      const started = await client.call("claude_peer_delegate", {
+        task,
+        cwd: testDir,
+      });
+      const status = await waitForTerminal(client, jobId(started));
+      assert.equal(status.status, "failed");
+      assert.equal(status.error_type, "UsageLimit");
+      assert.equal(status.unavailable_until, null);
+      assert.equal(
+        status.error,
+        "Claude Code usage limit reached; reset time was not provided.",
+      );
+    }
+  } finally {
+    await client.close();
+  }
+});
+
+test("temporary rate limits and empty failures remain generic errors", async () => {
+  const client = new McpTestClient();
+  try {
+    await client.initialize();
+
+    const temporary = await client.call("claude_peer_delegate", {
+      task: "TEMPORARY_RATE_LIMIT",
+      cwd: testDir,
+    });
+    const temporaryStatus = await waitForTerminal(client, jobId(temporary));
+    assert.equal(temporaryStatus.status, "failed");
+    assert.equal(temporaryStatus.error_type, null);
+    assert.equal(temporaryStatus.unavailable_until, null);
+    assert.equal(
+      temporaryStatus.error,
+      "Server is temporarily limiting requests (not your usage limit)",
+    );
+
+    const empty = await client.call("claude_peer_delegate", {
+      task: "EMPTY_FAILURE",
+      cwd: testDir,
+    });
+    const emptyStatus = await waitForTerminal(client, jobId(empty));
+    assert.equal(emptyStatus.status, "failed");
+    assert.equal(emptyStatus.error, "Claude Code exited (1)");
+  } finally {
+    await client.close();
+  }
+});
+
 test("follow-up resumes the returned Claude session", async () => {
   const client = new McpTestClient();
   await client.initialize();
