@@ -111,6 +111,11 @@ const sessionId = resumeIndex >= 0 ? args[resumeIndex + 1] : randomUUID();
 const result = prompt.includes("ECHO_ARGS")
   ? JSON.stringify({
       args,
+      codexHome: process.env.CODEX_HOME ?? null,
+      maxSessionHistoryEvents:
+        process.env.CLAUDE_PEER_MAX_SESSION_HISTORY_EVENTS ?? null,
+      sessionHistoryDir:
+        process.env.CLAUDE_PEER_SESSION_HISTORY_DIR ?? null,
       subprocessEnvScrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB,
     })
   : prompt.includes("FOLLOW_UP")
@@ -126,5 +131,12 @@ process.stdout.write(
     permission_denials: [],
     duration_ms: 10,
     num_turns: 1,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_creation_input_tokens: 2,
+      cache_read_input_tokens: 3,
+    },
+    total_cost_usd: 0.01,
   })}\n`,
 );

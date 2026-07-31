@@ -2,7 +2,27 @@
 
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { createInterface } from "node:readline";
 import process from "node:process";
 import { promisify } from "node:util";
@@ -23,9 +43,34 @@ const MAX_OUTPUT_BYTES =
 const MAX_TASK_BYTES = 256 * 1024;
 const MAX_RUNNING_JOBS = 4;
 const MAX_RETAINED_TERMINAL_JOBS = 50;
+const HARD_MAX_RETAINED_SESSION_EVENTS = 1000;
+const parsedMaxRetainedSessionEvents = Number.parseInt(
+  process.env.CLAUDE_PEER_MAX_SESSION_HISTORY_EVENTS ||
+    String(HARD_MAX_RETAINED_SESSION_EVENTS),
+  10,
+);
+const MAX_RETAINED_SESSION_EVENTS =
+  Number.isInteger(parsedMaxRetainedSessionEvents) &&
+  parsedMaxRetainedSessionEvents >= 1
+    ? Math.min(
+        parsedMaxRetainedSessionEvents,
+        HARD_MAX_RETAINED_SESSION_EVENTS,
+      )
+    : HARD_MAX_RETAINED_SESSION_EVENTS;
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const PEER_DEPTH_ENV = "CLAUDE_PEER_DEPTH";
 const CLAUDE_CLI = process.env.CLAUDE_PEER_CLI || "claude";
+const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
+const SESSION_HISTORY_OVERRIDE =
+  process.env.CLAUDE_PEER_SESSION_HISTORY_DIR || null;
+const SESSION_HISTORY_CONFIG_ERROR =
+  SESSION_HISTORY_OVERRIDE && !isAbsolute(SESSION_HISTORY_OVERRIDE)
+    ? "CLAUDE_PEER_SESSION_HISTORY_DIR must be an absolute path"
+    : null;
+const SESSION_HISTORY_DIR = resolve(
+  SESSION_HISTORY_OVERRIDE ||
+    join(CODEX_HOME, "state", "claude-peer", "sessions"),
+);
 const parsedKillGraceMs = Number.parseInt(process.env.CLAUDE_PEER_KILL_GRACE_MS || "2000", 10);
 const KILL_GRACE_MS =
   Number.isInteger(parsedKillGraceMs) && parsedKillGraceMs >= 10
@@ -38,19 +83,61 @@ const RECURSION_GUARD_MESSAGE = `claude-peer is disabled inside nested peer sess
 const jobs = new Map();
 let nextCompletionSequence = 1;
 
+function resolveFromExistingAncestor(targetPath) {
+  let currentPath = resolve(targetPath);
+  const missingSegments = [];
+  while (!existsSync(currentPath)) {
+    const parentPath = dirname(currentPath);
+    if (parentPath === currentPath) return resolve(targetPath);
+    missingSegments.unshift(basename(currentPath));
+    currentPath = parentPath;
+  }
+  return resolve(realpathSync(currentPath), ...missingSegments);
+}
+
+function toClaudePermissionPath(targetPath) {
+  let normalized = resolve(targetPath).replaceAll("\\", "/");
+  if (/^[A-Za-z]:\//.test(normalized)) {
+    normalized = `/${normalized[0].toLowerCase()}${normalized.slice(2)}`;
+  }
+  return `/${normalized.replace(/\/+$/, "")}/**`;
+}
+
+const SESSION_HISTORY_DENY_PATHS = [
+  ...new Set([
+    SESSION_HISTORY_DIR,
+    resolveFromExistingAncestor(SESSION_HISTORY_DIR),
+  ]),
+];
+const SESSION_HISTORY_DENY_RULES = SESSION_HISTORY_DENY_PATHS.flatMap(
+  (targetPath) => {
+    const pattern = toClaudePermissionPath(targetPath);
+    return [`Read(${pattern})`, `Edit(${pattern})`];
+  },
+);
+
 const BASE_SANDBOX_SETTINGS = {
+  permissions: {
+    deny: SESSION_HISTORY_DENY_RULES,
+  },
   sandbox: {
     enabled: true,
     autoAllowBashIfSandboxed: true,
     allowUnsandboxedCommands: false,
     failIfUnavailable: true,
+    filesystem: {
+      denyRead: SESSION_HISTORY_DENY_PATHS,
+      denyWrite: SESSION_HISTORY_DENY_PATHS,
+    },
   },
 };
 
 const READ_ONLY_SANDBOX_SETTINGS = JSON.stringify({
+  ...BASE_SANDBOX_SETTINGS,
   sandbox: {
     ...BASE_SANDBOX_SETTINGS.sandbox,
     filesystem: {
+      ...BASE_SANDBOX_SETTINGS.sandbox.filesystem,
       denyWrite: ["/"],
     },
   },
@@ -266,10 +353,119 @@ function formatPeerResult(result) {
     parts.push(`unavailable_until: ${result.unavailableUntil}`);
   }
   if (result.error) parts.push(`error: ${result.error}`);
+  if (result.historyWarning) {
+    parts.push(`session_history_warning: ${result.historyWarning}`);
+  }
   if (Array.isArray(result.permissionDenials) && result.permissionDenials.length > 0) {
     parts.push(`permission_denials: ${JSON.stringify(result.permissionDenials)}`);
   }
   return parts.join("\n\n") || "Claude peer returned no output.";
+}
+
+function sanitizeUsage(usage) {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
+  const sanitized = {};
+  for (const [key, value] of Object.entries(usage)) {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      sanitized[key] = value;
+    }
+  }
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+}
+
+function isPathWithin(parentPath, candidatePath) {
+  const pathFromParent = relative(parentPath, candidatePath);
+  return (
+    pathFromParent === "" ||
+    (pathFromParent !== ".." &&
+      !pathFromParent.startsWith(`..${sep}`) &&
+      !isAbsolute(pathFromParent))
+  );
+}
+
+function pathsOverlap(leftPath, rightPath) {
+  return (
+    isPathWithin(leftPath, rightPath) ||
+    isPathWithin(rightPath, leftPath)
+  );
+}
+
+function pruneSessionEvents(historyRoot) {
+  const eventNames = readdirSync(historyRoot, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        /^\d{13}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/i.test(
+          entry.name,
+        ),
+    )
+    .map((entry) => entry.name)
+    .sort();
+  const excess = eventNames.length - MAX_RETAINED_SESSION_EVENTS;
+  for (let index = 0; index < excess; index += 1) {
+    try {
+      unlinkSync(join(historyRoot, eventNames[index]));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function writeSessionEvent(job) {
+  const result = job.result;
+  if (!result?.threadId) return;
+  if (SESSION_HISTORY_CONFIG_ERROR) {
+    throw new Error(SESSION_HISTORY_CONFIG_ERROR);
+  }
+
+  const workspacePath = realpathSync(resolve(job.cwd));
+  const predictedHistoryPath =
+    resolveFromExistingAncestor(SESSION_HISTORY_DIR);
+  if (
+    pathsOverlap(resolve(job.cwd), SESSION_HISTORY_DIR) ||
+    pathsOverlap(workspacePath, predictedHistoryPath)
+  ) {
+    throw new Error(
+      "Claude Peer session history must be outside the delegated workspace",
+    );
+  }
+
+  mkdirSync(SESSION_HISTORY_DIR, { recursive: true, mode: 0o700 });
+  chmodSync(SESSION_HISTORY_DIR, 0o700);
+  const historyRoot = realpathSync(SESSION_HISTORY_DIR);
+  if (pathsOverlap(workspacePath, historyRoot)) {
+    throw new Error(
+      "Claude Peer session history must be outside the delegated workspace",
+    );
+  }
+  const event = {
+    version: 1,
+    thread_id: result.threadId,
+    job_id: job.jobId,
+    started_at: job.startedAt,
+    finished_at: job.finishedAt,
+    cwd: job.cwd,
+    allow_writes: job.allowWrites,
+    model: job.model,
+    effort: job.effort,
+    duration_ms: result.durationMs ?? null,
+    num_turns: result.numTurns ?? null,
+    usage: sanitizeUsage(result.usage),
+    total_cost_usd: result.totalCostUsd ?? null,
+  };
+  const eventName = `${Date.now()}-${randomUUID()}.json`;
+  const eventPath = join(historyRoot, eventName);
+  const temporaryPath = join(
+    historyRoot,
+    `.${eventName}.${process.pid}.tmp`,
+  );
+  writeFileSync(temporaryPath, `${JSON.stringify(event)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  renameSync(temporaryPath, eventPath);
+  pruneSessionEvents(historyRoot);
 }
 
 function validateCwd(cwd) {
@@ -416,13 +612,17 @@ class ClaudeProcessClient {
   run({ task, threadId }) {
     return new Promise((resolve, reject) => {
       const args = this.buildArgs(threadId);
+      const childEnvironment = {
+        ...process.env,
+        [PEER_DEPTH_ENV]: String(peerDepth + 1),
+        CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
+      };
+      delete childEnvironment.CLAUDE_PEER_SESSION_HISTORY_DIR;
+      delete childEnvironment.CLAUDE_PEER_MAX_SESSION_HISTORY_EVENTS;
+      delete childEnvironment.CODEX_HOME;
       const child = spawn(CLAUDE_CLI, args, {
         cwd: this.cwd,
-        env: {
-          ...process.env,
-          [PEER_DEPTH_ENV]: String(peerDepth + 1),
-          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
-        },
+        env: childEnvironment,
         detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -512,6 +712,12 @@ class ClaudeProcessClient {
             permissionDenials: payload.permission_denials,
             durationMs: payload.duration_ms,
             numTurns: payload.num_turns,
+            usage: sanitizeUsage(payload.usage),
+            totalCostUsd:
+              typeof payload.total_cost_usd === "number" &&
+              Number.isFinite(payload.total_cost_usd)
+                ? payload.total_cost_usd
+                : null,
           });
         } catch (error) {
           rejectOnce(error);
@@ -613,6 +819,13 @@ function transitionJobToTerminal(job, status, result) {
   job.result = result;
   job.finishedAt = new Date().toISOString();
   job.completionSequence = nextCompletionSequence++;
+  if (status === "completed") {
+    try {
+      writeSessionEvent(job);
+    } catch (error) {
+      job.result = { ...result, historyWarning: error.message };
+    }
+  }
   return true;
 }
 
@@ -637,6 +850,10 @@ function startJob(args, threadId = null) {
     jobId,
     status: "running",
     startedAt: new Date().toISOString(),
+    cwd: value.cwd,
+    allowWrites: value.allowWrites,
+    model: value.model ?? null,
+    effort: value.effort ?? null,
     result: null,
     client: null,
     cancelRequested: false,
