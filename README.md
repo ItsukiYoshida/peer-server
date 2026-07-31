@@ -16,17 +16,37 @@ captured output at 8 MiB, and retains the latest 50 terminal jobs. Cancellation
 first enters `cancelling`, terminates the worker process group, escalates from
 `SIGTERM` to `SIGKILL` when necessary, and only then reports `cancelled`.
 
-## Local installation
+## Installation
 
-The personal marketplace entries resolve through `/Users/cat/plugins`. Keep those
-stable entrypoints as symlinks to this repository:
+### Directly from GitHub (recommended)
+
+Register this repository as a Codex plugin marketplace, then install either or
+both plugins:
 
 ```bash
-ln -s /Users/cat/repos/indivisual/peer-server/main/codex-peer /Users/cat/plugins/codex-peer
-ln -s /Users/cat/repos/indivisual/peer-server/main/claude-peer /Users/cat/plugins/claude-peer
-codex plugin add codex-peer@personal
-codex plugin add claude-peer@personal
+codex plugin marketplace add ItsukiYoshida/peer-server --ref main
+codex plugin add codex-peer@peer-server
+codex plugin add claude-peer@peer-server
 ```
+
+No clone or symlink is required. Start a new Codex session after installation so
+the new MCP servers are loaded.
+
+### From a local checkout
+
+Use a local marketplace while developing or testing repository changes:
+
+```bash
+git clone https://github.com/ItsukiYoshida/peer-server.git
+cd peer-server
+codex plugin marketplace add "$PWD"
+codex plugin add codex-peer@peer-server
+codex plugin add claude-peer@peer-server
+```
+
+The `@peer-server` suffix comes from the marketplace name in
+`.agents/plugins/marketplace.json`. A personal marketplace and `~/plugins`
+symlinks are not required.
 
 The packaged MCP configurations launch their bridge scripts relative to each plugin
 root, so installed cache snapshots do not depend on a separate source checkout.
