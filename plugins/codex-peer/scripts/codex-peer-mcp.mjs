@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import process from "node:process";
 
 const SERVER_VERSION = "0.1.0";
-const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const MAX_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const HARD_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const parsedMaxOutputBytes = Number.parseInt(
