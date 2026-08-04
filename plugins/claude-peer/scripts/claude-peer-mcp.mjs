@@ -59,6 +59,7 @@ const MAX_RETAINED_SESSION_EVENTS =
     : HARD_MAX_RETAINED_SESSION_EVENTS;
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const PEER_DEPTH_ENV = "CLAUDE_PEER_DEPTH";
+const SIBLING_PEER_DEPTH_ENV = "CODEX_PEER_DEPTH";
 const CLAUDE_CLI = process.env.CLAUDE_PEER_CLI || "claude";
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), ".codex");
 const SESSION_HISTORY_OVERRIDE =
@@ -78,8 +79,11 @@ const KILL_GRACE_MS =
     : 2000;
 const parsedPeerDepth = Number.parseInt(process.env[PEER_DEPTH_ENV] || "0", 10);
 const peerDepth = Number.isInteger(parsedPeerDepth) && parsedPeerDepth >= 0 ? parsedPeerDepth : 0;
-const isNestedPeer = peerDepth > 0;
-const RECURSION_GUARD_MESSAGE = `claude-peer is disabled inside nested peer sessions (depth ${peerDepth})`;
+const parsedSiblingPeerDepth = Number.parseInt(process.env[SIBLING_PEER_DEPTH_ENV] || "0", 10);
+const siblingPeerDepth =
+  Number.isInteger(parsedSiblingPeerDepth) && parsedSiblingPeerDepth >= 0 ? parsedSiblingPeerDepth : 0;
+const isNestedPeer = peerDepth > 0 || siblingPeerDepth > 0;
+const RECURSION_GUARD_MESSAGE = `claude-peer is disabled inside nested peer sessions (claude depth ${peerDepth}, codex depth ${siblingPeerDepth})`;
 const DELEGATED_JOB_NOTICE =
   "\n\n[peer-delegated job] This session is a delegated peer job. Never invoke codex_peer or claude_peer tools in this session, even if globally loaded instructions (such as AGENTS.md review gates) call for peer reviews, and even if this session is later resumed interactively. If additional peer review seems necessary, state that in your final report instead of starting one.";
 const jobs = new Map();
