@@ -22,6 +22,64 @@ if (args[0] === "auth" && args[1] === "status") {
 let prompt = "";
 for await (const chunk of process.stdin) prompt += chunk;
 
+if (prompt.trim() === "USAGE_LIMIT") {
+  process.stderr.write(
+    "Permission mode forced to default — CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set\n",
+  );
+  process.stdout.write(
+    `${JSON.stringify({
+      is_error: true,
+      subtype: "error_during_execution",
+      session_id: randomUUID(),
+      api_error_status: 429,
+      error: "rate_limit",
+      result: "You've hit your session limit · resets 4:10pm (Asia/Tokyo)",
+    })}\n`,
+  );
+  process.exit(1);
+}
+
+const namedUsageLimits = new Map([
+  ["FAST_USAGE_LIMIT", "You've hit your fast limit"],
+  ["MONTHLY_USAGE_LIMIT", "You've hit your monthly limit"],
+  ["MONTHLY_SPEND_USAGE_LIMIT", "You've hit your monthly spend limit"],
+  ["FABLE_USAGE_LIMIT", "You've reached your Fable 5 limit."],
+  ["WEEKLY_USAGE_LIMIT", "You've hit your weekly limit"],
+  ["OPUS_USAGE_LIMIT", "You've reached your Opus limit."],
+  ["SONNET_USAGE_LIMIT", "You've hit your Sonnet limit"],
+]);
+if (namedUsageLimits.has(prompt.trim())) {
+  process.stdout.write(
+    `${JSON.stringify({
+      is_error: true,
+      subtype: "error_during_execution",
+      error: "rate_limit",
+      result: namedUsageLimits.get(prompt.trim()),
+    })}\n`,
+  );
+  process.exit(1);
+}
+
+if (prompt.includes("TEMPORARY_RATE_LIMIT")) {
+  process.stderr.write(
+    "Permission mode forced to default — CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set\n",
+  );
+  process.stdout.write(
+    `${JSON.stringify({
+      is_error: true,
+      subtype: "error_during_execution",
+      api_error_status: 429,
+      error: "rate_limit",
+      result: "Server is temporarily limiting requests (not your usage limit)",
+    })}\n`,
+  );
+  process.exit(1);
+}
+
+if (prompt.includes("EMPTY_FAILURE")) {
+  process.exit(1);
+}
+
 if (prompt.includes("FAIL")) {
   process.stderr.write("fake Claude failure\n");
   process.exit(2);
@@ -53,6 +111,11 @@ const sessionId = resumeIndex >= 0 ? args[resumeIndex + 1] : randomUUID();
 const result = prompt.includes("ECHO_ARGS")
   ? JSON.stringify({
       args,
+      codexHome: process.env.CODEX_HOME ?? null,
+      maxSessionHistoryEvents:
+        process.env.CLAUDE_PEER_MAX_SESSION_HISTORY_EVENTS ?? null,
+      sessionHistoryDir:
+        process.env.CLAUDE_PEER_SESSION_HISTORY_DIR ?? null,
       subprocessEnvScrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB,
     })
   : prompt.includes("FOLLOW_UP")
@@ -68,5 +131,12 @@ process.stdout.write(
     permission_denials: [],
     duration_ms: 10,
     num_turns: 1,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_creation_input_tokens: 2,
+      cache_read_input_tokens: 3,
+    },
+    total_cost_usd: 0.01,
   })}\n`,
 );

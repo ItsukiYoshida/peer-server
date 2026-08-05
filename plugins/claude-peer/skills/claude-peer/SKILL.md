@@ -22,6 +22,8 @@ stores an API key or subscription token.
   start background jobs and immediately return a `job_id`. Poll with
   `claude_peer_status`; after the job reaches a terminal state, retrieve the
   response with `claude_peer_result`.
+- If Claude Code reaches its subscription usage limit, status and result responses
+  report `error_type: UsageLimit` and `unavailable_until` with Claude's reset time.
 - Use `claude_peer_start` for an explicitly constructed background task and
   `claude_peer_cancel` to stop one.
 
@@ -39,6 +41,15 @@ Both modes fail closed when sandboxing is unavailable.
 At most four jobs may run concurrently. Tasks larger than 256 KiB and captured
 responses larger than 8 MiB are rejected. Cancellation reports `cancelling` until
 the worker process group has actually stopped.
+
+Session metadata is recorded as private per-job JSON event files under the local
+Codex state directory after each successful Claude response. The files include
+thread and job IDs, workspace paths, timestamps, duration, turn count, and token
+usage, but never task prompts or Claude responses. The latest 1,000 events are
+retained. Peer processes are denied access to this state, and the history is
+deliberately not exposed as an MCP tool because session IDs can resume stored
+conversations. A custom history directory must be absolute and outside delegated
+workspaces.
 
 The plugin intentionally does not use Claude Code bare mode because bare mode
 does not read subscription OAuth credentials or the operating system credential

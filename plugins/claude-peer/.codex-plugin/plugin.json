@@ -1,6 +1,6 @@
 {
   "name": "claude-peer",
-  "version": "0.1.0+codex.20260731005551",
+  "version": "0.1.0+codex.20260731063021",
   "description": "Use a local Claude Code session from Codex through the Claude CLI.",
   "author": {
     "name": "ItsukiYoshida"

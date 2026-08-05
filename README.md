@@ -11,6 +11,21 @@ Both plugins use background jobs. A long-running review or delegated task return
 `job_id` immediately; callers poll the matching status tool and retrieve the result
 after the job reaches a terminal state.
 
+When Claude Code reports a subscription usage limit, failed job status and result
+responses include `error_type: UsageLimit` and the reset time as
+`unavailable_until`, when Claude provides one.
+
+Successful Claude Peer jobs are recorded as private per-job JSON event files under
+`$CODEX_HOME/state/claude-peer/sessions` (or
+`~/.codex/state/claude-peer/sessions`). Set
+`CLAUDE_PEER_SESSION_HISTORY_DIR` on the MCP server process to override the path
+with an absolute directory outside delegated workspaces. Each event includes
+thread and job IDs, workspace, timestamps, duration, turn count, and token usage.
+Task prompts and Claude responses are not stored. The latest 1,000 events are
+retained. Peer processes are denied access to the history directory, and the
+history is not exposed as an MCP tool because a Claude session ID can resume its
+stored conversation.
+
 Each bridge accepts at most four concurrent jobs, caps task input at 256 KiB and
 captured output at 8 MiB, and retains the latest 50 terminal jobs. Cancellation
 first enters `cancelling`, terminates the worker process group, escalates from
