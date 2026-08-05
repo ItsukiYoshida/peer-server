@@ -1047,7 +1047,7 @@ async function callTool(name, args) {
     const job = startJob({
       ...value,
       allow_writes: false,
-      task: `${scope}${focus}\nBe read-only. Report only reproducible P0-P2 findings with severity, exact file/line evidence, the triggering scenario, impact, and a concrete fix. If there are no findings, say No findings. State validation ceilings separately. Review the code and diff statically: do not run test suites, builds, linters, deploys, package installs, or other CI-equivalent commands; validation is the delegating agent's responsibility.`,
+      task: `${scope}${focus}\nBe read-only. Report only reproducible P0-P2 findings with severity, exact file/line evidence, the triggering scenario, impact, and a concrete fix. If there are no findings, say No findings. State validation ceilings separately. Review the code and diff statically: do not run test suites, builds, linters, deploys, package installs, or other CI-equivalent commands; validation is the delegating agent's responsibility. If the diff includes user-facing copy (labels, messages, emails), also review it for spec-notation leakage (e.g. pipe/slash-delimited alternatives), internal jargon or key names surfacing in UI text, and terminology inconsistency with existing copy.`,
     });
     return formatPeerResult({ ...publicJob(job), status: "started" });
   }
