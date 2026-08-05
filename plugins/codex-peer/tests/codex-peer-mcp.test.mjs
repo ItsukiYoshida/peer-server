@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -10,6 +12,9 @@ const testDir = fileURLToPath(new URL(".", import.meta.url));
 const pluginRoot = fileURLToPath(new URL("..", import.meta.url));
 const bridgePath = fileURLToPath(new URL("../scripts/codex-peer-mcp.mjs", import.meta.url));
 const fakeCodexPath = fileURLToPath(new URL("./fake-codex.mjs", import.meta.url));
+// Isolate the delegated-thread registry (and any other CODEX_HOME state) from
+// the developer's real ~/.codex during tests.
+const codexHomeDir = mkdtempSync(join(tmpdir(), "codex-peer-home-"));
 
 class McpTestClient {
   constructor() {
@@ -17,6 +22,7 @@ class McpTestClient {
       cwd: pluginRoot,
       env: {
         ...process.env,
+        CODEX_HOME: codexHomeDir,
         CODEX_PEER_CLI: fakeCodexPath,
         CODEX_PEER_KILL_GRACE_MS: "50",
         CODEX_PEER_MAX_OUTPUT_BYTES: "1024",
@@ -215,6 +221,7 @@ test("packaged MCP configuration launches the package-relative bridge", async ()
     cwd: resolvedCwd,
     env: {
       ...process.env,
+      CODEX_HOME: codexHomeDir,
       CODEX_PEER_CLI: fakeCodexPath,
     },
     stdio: ["pipe", "pipe", "pipe"],

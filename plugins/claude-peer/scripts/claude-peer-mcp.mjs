@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   renameSync,
   statSync,
@@ -86,6 +87,96 @@ const isNestedPeer = peerDepth > 0 || siblingPeerDepth > 0;
 const RECURSION_GUARD_MESSAGE = `claude-peer is disabled inside nested peer sessions (claude depth ${peerDepth}, codex depth ${siblingPeerDepth})`;
 const DELEGATED_JOB_NOTICE =
   "\n\n[peer-delegated job] This session is a delegated peer job. Never invoke codex_peer or claude_peer tools in this session, even if globally loaded instructions (such as AGENTS.md review gates) call for peer reviews, and even if this session is later resumed interactively. If additional peer review seems necessary, state that in your final report instead of starting one.";
+
+// Delegated-thread registry shared with codex-peer: peer-spawned session IDs
+// are recorded so that a bridge can refuse peer tools when its host session is
+// a delegated thread that was later resumed interactively (env-based depth
+// guards do not survive `codex resume` / `claude --resume`, which start fresh
+// processes without the depth markers).
+const DELEGATED_THREADS_REGISTRY = join(
+  CODEX_HOME,
+  "state",
+  "peer-delegated-threads.jsonl",
+);
+const DELEGATED_THREADS_MAX_LINES = 1000;
+const RESUMED_DELEGATION_GUARD_MESSAGE =
+  "claude-peer is disabled in this session: the host thread was started as a peer-delegated job. Resumed delegated sessions must not start peer jobs; report the need for review to the user instead.";
+
+function registerDelegatedThread(threadId) {
+  if (typeof threadId !== "string" || threadId.trim() === "") return;
+  try {
+    mkdirSync(dirname(DELEGATED_THREADS_REGISTRY), { recursive: true });
+    let lines = [];
+    if (existsSync(DELEGATED_THREADS_REGISTRY)) {
+      lines = readFileSync(DELEGATED_THREADS_REGISTRY, "utf8").split("\n").filter(Boolean);
+    }
+    if (lines.includes(threadId)) return;
+    lines.push(threadId);
+    if (lines.length > DELEGATED_THREADS_MAX_LINES) {
+      lines = lines.slice(-DELEGATED_THREADS_MAX_LINES);
+    }
+    writeFileSync(DELEGATED_THREADS_REGISTRY, `${lines.join("\n")}\n`);
+  } catch {
+    // Best-effort: the registry is a defense-in-depth layer, not a hard dependency.
+  }
+}
+
+function delegatedThreadIds() {
+  try {
+    if (!existsSync(DELEGATED_THREADS_REGISTRY)) return new Set();
+    return new Set(
+      readFileSync(DELEGATED_THREADS_REGISTRY, "utf8").split("\n").filter(Boolean),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function peerProcessField(pid, field) {
+  try {
+    return execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
+function hostRolloutThreadId() {
+  let pid = process.ppid;
+  for (let level = 0; level < 32 && pid > 1; level += 1) {
+    let openFiles = "";
+    try {
+      openFiles = execFileSync("lsof", ["-p", String(pid), "-Fn"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      openFiles = "";
+    }
+    const codexMatch = openFiles.match(
+      /rollout-[0-9T-]+-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl/,
+    );
+    if (codexMatch) return codexMatch[1];
+    const claudeMatch = openFiles.match(
+      /\.claude\/projects\/[^\n]*\/([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl/,
+    );
+    if (claudeMatch) return claudeMatch[1];
+    const parentPid = Number.parseInt(peerProcessField(pid, "ppid"), 10);
+    if (!Number.isInteger(parentPid) || parentPid <= 0 || parentPid === pid) return null;
+    pid = parentPid;
+  }
+  return null;
+}
+
+function assertHostNotDelegatedThread() {
+  const hostThreadId = hostRolloutThreadId();
+  if (hostThreadId && delegatedThreadIds().has(hostThreadId)) {
+    throw new Error(RESUMED_DELEGATION_GUARD_MESSAGE);
+  }
+}
+
 const jobs = new Map();
 let nextCompletionSequence = 1;
 
@@ -711,6 +802,7 @@ class ClaudeProcessClient {
           if (typeof payload.session_id !== "string" || payload.session_id.length === 0) {
             throw new Error("Claude Code result did not include a session ID");
           }
+          registerDelegatedThread(payload.session_id);
           resolveOnce({
             status: "completed",
             text: typeof payload.result === "string" ? payload.result : "",
@@ -936,8 +1028,15 @@ async function sanitizedAuthStatus() {
   });
 }
 
+const PEER_ACTION_TOOLS = new Set([
+  "claude_peer_review",
+  "claude_peer_delegate",
+  "claude_peer_follow_up",
+]);
+
 async function callTool(name, args) {
   if (isNestedPeer) throw new Error(RECURSION_GUARD_MESSAGE);
+  if (PEER_ACTION_TOOLS.has(name)) assertHostNotDelegatedThread();
   if (name === "claude_peer_auth_status") return await sanitizedAuthStatus();
   if (name === "claude_peer_review") {
     const value = normalizeArgs(args);

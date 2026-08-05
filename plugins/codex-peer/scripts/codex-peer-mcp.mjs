@@ -3,6 +3,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import process from "node:process";
 
 const SERVER_VERSION = "0.1.0";
@@ -72,6 +75,77 @@ function hasPeerBridgeAncestor() {
     pid = parentPid;
   }
   return false;
+}
+
+// Delegated-thread registry: peer-spawned thread IDs are recorded so that a
+// bridge can refuse peer tools when its host session is a delegated thread
+// that was later resumed interactively (env-based depth guards do not survive
+// `codex resume`, which starts a fresh process without the depth markers).
+const DELEGATED_THREADS_REGISTRY = join(
+  process.env.CODEX_HOME || join(homedir(), ".codex"),
+  "state",
+  "peer-delegated-threads.jsonl",
+);
+const DELEGATED_THREADS_MAX_LINES = 1000;
+const RESUMED_DELEGATION_GUARD_MESSAGE =
+  "codex-peer is disabled in this session: the host thread was started as a peer-delegated job. Resumed delegated sessions must not start peer jobs; report the need for review to the user instead.";
+
+function registerDelegatedThread(threadId) {
+  if (typeof threadId !== "string" || threadId.trim() === "") return;
+  try {
+    mkdirSync(dirname(DELEGATED_THREADS_REGISTRY), { recursive: true });
+    let lines = [];
+    if (existsSync(DELEGATED_THREADS_REGISTRY)) {
+      lines = readFileSync(DELEGATED_THREADS_REGISTRY, "utf8").split("\n").filter(Boolean);
+    }
+    if (lines.includes(threadId)) return;
+    lines.push(threadId);
+    if (lines.length > DELEGATED_THREADS_MAX_LINES) {
+      lines = lines.slice(-DELEGATED_THREADS_MAX_LINES);
+    }
+    writeFileSync(DELEGATED_THREADS_REGISTRY, `${lines.join("\n")}\n`);
+  } catch {
+    // Best-effort: the registry is a defense-in-depth layer, not a hard dependency.
+  }
+}
+
+function delegatedThreadIds() {
+  try {
+    if (!existsSync(DELEGATED_THREADS_REGISTRY)) return new Set();
+    return new Set(
+      readFileSync(DELEGATED_THREADS_REGISTRY, "utf8").split("\n").filter(Boolean),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function hostRolloutThreadId() {
+  let pid = process.ppid;
+  for (let level = 0; level < 32 && pid > 1; level += 1) {
+    let openFiles = "";
+    try {
+      openFiles = execFileSync("lsof", ["-p", String(pid), "-Fn"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      openFiles = "";
+    }
+    const match = openFiles.match(/rollout-[0-9T-]+-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl/);
+    if (match) return match[1];
+    const parentPid = Number.parseInt(processField(pid, "ppid"), 10);
+    if (!Number.isInteger(parentPid) || parentPid <= 0 || parentPid === pid) return null;
+    pid = parentPid;
+  }
+  return null;
+}
+
+function assertHostNotDelegatedThread() {
+  const hostThreadId = hostRolloutThreadId();
+  if (hostThreadId && delegatedThreadIds().has(hostThreadId)) {
+    throw new Error(RESUMED_DELEGATION_GUARD_MESSAGE);
+  }
 }
 
 const tools = [
@@ -471,6 +545,7 @@ class AppServerClient {
       })).thread;
     }
     if (!thread?.id) throw new Error("app-server did not return a thread ID");
+    registerDelegatedThread(thread.id);
 
     const sandboxPolicy = this.allowWrites
       ? { type: "workspaceWrite", writableRoots: [this.cwd], networkAccess: true }
@@ -657,8 +732,16 @@ function publicJob(job) {
   };
 }
 
+const PEER_ACTION_TOOLS = new Set([
+  "codex_peer_review",
+  "codex_peer_delegate",
+  "codex_peer_follow_up",
+  "codex_peer_start",
+]);
+
 async function callTool(name, args) {
   if (isNestedPeer) throw new Error(RECURSION_GUARD_MESSAGE);
+  if (PEER_ACTION_TOOLS.has(name)) assertHostNotDelegatedThread();
   if (name === "codex_peer_review") {
     const value = normalizeArgs(args);
     const scope = value.base ? `Review the changes compared with ${value.base}.` : "Review the current uncommitted changes.";
