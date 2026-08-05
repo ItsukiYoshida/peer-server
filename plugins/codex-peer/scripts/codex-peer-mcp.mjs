@@ -749,7 +749,7 @@ async function callTool(name, args) {
     const job = startJob({
       ...value,
       allow_writes: false,
-      task: `${scope}${focus}\nBe read-only. Report concrete findings with severity, file/line evidence, and suggested fixes.`,
+      task: `${scope}${focus}\nBe read-only. Report concrete findings with severity, file/line evidence, and suggested fixes. Review the code and diff statically: do not run test suites, builds, linters, deploys, package installs, or other CI-equivalent commands; validation is the delegating agent's responsibility.`,
     });
     return formatPeerResult({ ...publicJob(job), status: "started" });
   }
