@@ -39,11 +39,15 @@ class McpTestClient {
     this.ownsSessionHistoryDir = !sessionHistoryDir;
     this.sessionHistoryDir =
       sessionHistoryDir || mkdtempSync(join(tmpdir(), "claude-peer-sessions-"));
+    // Isolate the delegated-thread registry (and any other CODEX_HOME state)
+    // from the developer's real ~/.codex during tests.
+    this.codexHomeDir = mkdtempSync(join(tmpdir(), "claude-peer-home-"));
     this.closePromise = null;
     this.child = spawn(process.execPath, [bridgePath], {
       cwd: pluginRoot,
       env: {
         ...process.env,
+        CODEX_HOME: this.codexHomeDir,
         CLAUDE_PEER_CLI: fakeClaudePath,
         CLAUDE_PEER_KILL_GRACE_MS: "50",
         CLAUDE_PEER_MAX_OUTPUT_BYTES: String(maxOutputBytes),
