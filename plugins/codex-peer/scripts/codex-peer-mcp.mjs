@@ -22,6 +22,7 @@ const MAX_RUNNING_JOBS = 4;
 const MAX_RETAINED_TERMINAL_JOBS = 50;
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const PEER_DEPTH_ENV = "CODEX_PEER_DEPTH";
+const SIBLING_PEER_DEPTH_ENV = "CLAUDE_PEER_DEPTH";
 const PEER_BRIDGE_NAME = "codex-peer-mcp.mjs";
 const CODEX_CLI = process.env.CODEX_PEER_CLI || "codex";
 const parsedKillGraceMs = Number.parseInt(process.env.CODEX_PEER_KILL_GRACE_MS || "2000", 10);
@@ -31,8 +32,16 @@ const KILL_GRACE_MS =
     : 2000;
 const parsedPeerDepth = Number.parseInt(process.env[PEER_DEPTH_ENV] || "0", 10);
 const peerDepth = Number.isInteger(parsedPeerDepth) && parsedPeerDepth >= 0 ? parsedPeerDepth : 0;
-const isNestedPeer = peerDepth > 0 || hasPeerBridgeAncestor();
-const nestedPeerReason = peerDepth > 0 ? `depth ${peerDepth}` : "parent bridge detected";
+const parsedSiblingPeerDepth = Number.parseInt(process.env[SIBLING_PEER_DEPTH_ENV] || "0", 10);
+const siblingPeerDepth =
+  Number.isInteger(parsedSiblingPeerDepth) && parsedSiblingPeerDepth >= 0 ? parsedSiblingPeerDepth : 0;
+const isNestedPeer = peerDepth > 0 || siblingPeerDepth > 0 || hasPeerBridgeAncestor();
+const nestedPeerReason =
+  peerDepth > 0
+    ? `depth ${peerDepth}`
+    : siblingPeerDepth > 0
+      ? `claude-peer depth ${siblingPeerDepth}`
+      : "parent bridge detected";
 const RECURSION_GUARD_MESSAGE = `codex-peer is disabled inside nested peer sessions (${nestedPeerReason})`;
 const DELEGATED_JOB_NOTICE =
   "\n\n[peer-delegated job] This session is a delegated peer job. Never invoke codex_peer or claude_peer tools in this session, even if globally loaded instructions (such as AGENTS.md review gates) call for peer reviews, and even if this session is later resumed interactively. If additional peer review seems necessary, state that in your final report instead of starting one.";
