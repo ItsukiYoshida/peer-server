@@ -80,6 +80,8 @@ const parsedPeerDepth = Number.parseInt(process.env[PEER_DEPTH_ENV] || "0", 10);
 const peerDepth = Number.isInteger(parsedPeerDepth) && parsedPeerDepth >= 0 ? parsedPeerDepth : 0;
 const isNestedPeer = peerDepth > 0;
 const RECURSION_GUARD_MESSAGE = `claude-peer is disabled inside nested peer sessions (depth ${peerDepth})`;
+const DELEGATED_JOB_NOTICE =
+  "\n\n[peer-delegated job] This session is a delegated peer job. Never invoke codex_peer or claude_peer tools in this session, even if globally loaded instructions (such as AGENTS.md review gates) call for peer reviews, and even if this session is later resumed interactively. If additional peer review seems necessary, state that in your final report instead of starting one.";
 const jobs = new Map();
 let nextCompletionSequence = 1;
 
@@ -863,7 +865,7 @@ function startJob(args, threadId = null) {
   const client = new ClaudeProcessClient(value);
   job.client = client;
   job.completionPromise = runWithTimeout(
-    client.run({ task: value.task, threadId }),
+    client.run({ task: value.task + DELEGATED_JOB_NOTICE, threadId }),
     value.timeoutMs,
   )
     .then((result) => {

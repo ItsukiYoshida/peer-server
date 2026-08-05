@@ -22,7 +22,11 @@ if (args[0] === "auth" && args[1] === "status") {
 let prompt = "";
 for await (const chunk of process.stdin) prompt += chunk;
 
-if (prompt.trim() === "USAGE_LIMIT") {
+// The bridge appends a delegated-job notice to every task, so scenario
+// selectors match on the first line of the prompt rather than the whole text.
+const promptKey = prompt.trim().split("\n", 1)[0].trim();
+
+if (promptKey === "USAGE_LIMIT") {
   process.stderr.write(
     "Permission mode forced to default — CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set\n",
   );
@@ -48,13 +52,13 @@ const namedUsageLimits = new Map([
   ["OPUS_USAGE_LIMIT", "You've reached your Opus limit."],
   ["SONNET_USAGE_LIMIT", "You've hit your Sonnet limit"],
 ]);
-if (namedUsageLimits.has(prompt.trim())) {
+if (namedUsageLimits.has(promptKey)) {
   process.stdout.write(
     `${JSON.stringify({
       is_error: true,
       subtype: "error_during_execution",
       error: "rate_limit",
-      result: namedUsageLimits.get(prompt.trim()),
+      result: namedUsageLimits.get(promptKey),
     })}\n`,
   );
   process.exit(1);
